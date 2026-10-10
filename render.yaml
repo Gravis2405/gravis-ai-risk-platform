@@ -20,7 +20,3 @@ services:
         generateValue: true
       - key: INGEST_API_KEY
         generateValue: true
-      - key: INITIAL_ADMIN_EMAIL
-        value: snksys2405@gmail.com
-      - key: INITIAL_ADMIN_PASSWORD
-        sync: false
