@@ -1,0 +1,16 @@
+{
+  "name": "gravis-ai-risk-platform",
+  "version": "1.0.0",
+  "private": true,
+  "description": "GRAVIS AI local digital risk analyst workspace and API",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=20" },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "express": "^4.21.2",
+    "helmet": "^8.0.0",
+    "jsonwebtoken": "^9.0.2",
+    "morgan": "^1.10.0",
+    "socket.io": "^4.8.1"
+  }
+}
