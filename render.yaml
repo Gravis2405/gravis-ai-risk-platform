@@ -1,12 +1,3 @@
-databases:
-  - name: gravis-ai-preview-db
-    databaseName: gravis_ai_preview_db
-    user: gravis_ai_preview_db_user
-    plan: free
-    region: singapore
-    postgresMajorVersion: "18"
-    ipAllowList: []
-
 services:
   - type: web
     name: gravis-ai-risk-platform
@@ -33,4 +24,3 @@ services:
         value: snksys2405@gmail.com
       - key: INITIAL_ADMIN_PASSWORD
         sync: false
-
