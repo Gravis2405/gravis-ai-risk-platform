@@ -8,6 +8,7 @@ const { Server } = require('socket.io');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const { Pool } = require('pg');
 
 const envFile = path.join(__dirname, '.env');
 if (fs.existsSync(envFile)) {
@@ -37,6 +38,7 @@ const allowedOrigins = (process.env.APP_ORIGIN || `http://localhost:${PORT}`).sp
 const io = new Server(server, { cors: { origin: allowedOrigins } });
 const dataDirectory = path.join(__dirname, 'data');
 const dataFile = process.env.DATA_FILE || path.join(dataDirectory, 'gravis.json');
+const postgresPool = process.env.DATABASE_URL ? new Pool({ connectionString: process.env.DATABASE_URL, max: 3, idleTimeoutMillis: 10000 }) : null;
 const now = Date.now();
 const seedThreats = [
   { id: 'GR-1042', targetName: 'Northstar Bank', channel: 'SOCIAL_MEDIA', type: 'Impersonation account', threatUrl: 'https://social.example/northstar_support', signals: { brandSimilarity: 91, logoSimilarity: 88, suspiciousUrl: true, accountAgeDays: 3 }, riskScore: 94, severity: 'CRITICAL', status: 'DETECTED', source: 'Demo seed', notes: [], detectedAt: new Date(now - 8 * 60000).toISOString() },
@@ -51,44 +53,61 @@ const seedAssets = [
   { id: 'asset-lumen', name: 'LumenPay', domain: 'lumenpay.example', keywords: ['LumenPay', 'Lumen Pay', 'Lumen Wallet'], assetType: 'Brand', createdAt: new Date(now - 9 * 86400000).toISOString() }
 ];
 
-fs.mkdirSync(path.dirname(dataFile), { recursive: true });
+if (!postgresPool) fs.mkdirSync(path.dirname(dataFile), { recursive: true });
 const demoUser = { id: 'demo-analyst', email: 'analyst@gravis.demo', name: 'Alex Morgan', role: 'admin', passwordHash: bcrypt.hashSync('GravisDemo!2026', 10), status: 'ACTIVE' };
 const defaultSettings = () => ({ workspaceName: 'GRAVIS AI Workspace', timezone: 'Asia/Kolkata', notifications: { critical: true, dailyDigest: false, caseUpdates: true } });
+function prepareDb(state) {
+  if (!state || !Array.isArray(state.users) || !Array.isArray(state.threats) || !Array.isArray(state.brandAssets)) throw new Error('Invalid data structure');
+  if (!Array.isArray(state.registrations)) state.registrations = [];
+  if (!state.settings || typeof state.settings !== 'object') state.settings = defaultSettings();
+  if (!state.settings.notifications) state.settings.notifications = defaultSettings().notifications;
+  if (production) {
+    state.users = state.users.filter(user => user.email !== demoUser.email);
+    state.threats = state.threats.filter(threat => threat.source !== 'Demo seed');
+    state.brandAssets = state.brandAssets.filter(asset => !String(asset.id).startsWith('asset-'));
+    if (!state.users.length) {
+      const email = String(process.env.INITIAL_ADMIN_EMAIL || '').trim().toLowerCase();
+      const password = process.env.INITIAL_ADMIN_PASSWORD;
+      if (!/^\S+@\S+\.\S+$/.test(email) || !isStrongPassword(password)) throw new Error('For first production startup, set INITIAL_ADMIN_EMAIL and a strong INITIAL_ADMIN_PASSWORD. Remove both variables after the administrator is created.');
+      state.users.push({ id: crypto.randomUUID(), email, name: 'Workspace Administrator', role: 'admin', passwordHash: bcrypt.hashSync(password, 12), status: 'ACTIVE', createdAt: new Date().toISOString() });
+    }
+    if (!state.users.some(user => user.role === 'admin' && user.status === 'ACTIVE')) throw new Error('Production startup requires at least one active workspace administrator.');
+  } else if (!state.users.some(user => user.email === demoUser.email)) {
+    state.users.push(demoUser);
+  }
+  for (const threat of state.threats) if (!Array.isArray(threat.notes)) threat.notes = [];
+  return state;
+}
+
+function emptyDb() {
+  return { version: 1, users: [], registrations: [], threats: production ? [] : seedThreats, brandAssets: production ? [] : seedAssets, settings: defaultSettings() };
+}
+
 let db;
-if (fs.existsSync(dataFile)) {
+if (postgresPool) {
+  db = prepareDb(emptyDb());
+} else if (fs.existsSync(dataFile)) {
   try {
-    db = JSON.parse(fs.readFileSync(dataFile, 'utf8'));
-    if (!Array.isArray(db.users) || !Array.isArray(db.threats) || !Array.isArray(db.brandAssets)) throw new Error('Invalid data structure');
-    if (!Array.isArray(db.registrations)) db.registrations = [];
-    if (!db.settings || typeof db.settings !== 'object') db.settings = defaultSettings();
-    if (!db.settings.notifications) db.settings.notifications = defaultSettings().notifications;
+    db = prepareDb(JSON.parse(fs.readFileSync(dataFile, 'utf8')));
   } catch (error) {
     throw new Error(`Could not read ${dataFile}: ${error.message}`);
   }
 } else {
-  db = { version: 1, users: [], registrations: [], threats: production ? [] : seedThreats, brandAssets: production ? [] : seedAssets, settings: defaultSettings() };
+  db = prepareDb(emptyDb());
 }
-if (production) {
-  db.users = db.users.filter(user => user.email !== demoUser.email);
-  db.threats = db.threats.filter(threat => threat.source !== 'Demo seed');
-  db.brandAssets = db.brandAssets.filter(asset => !String(asset.id).startsWith('asset-'));
-  if (!db.users.length) {
-    const email = String(process.env.INITIAL_ADMIN_EMAIL || '').trim().toLowerCase();
-    const password = process.env.INITIAL_ADMIN_PASSWORD;
-    if (!/^\S+@\S+\.\S+$/.test(email) || !isStrongPassword(password)) throw new Error('For first production startup, set INITIAL_ADMIN_EMAIL and a strong INITIAL_ADMIN_PASSWORD. Remove both variables after the administrator is created.');
-    db.users.push({ id: crypto.randomUUID(), email, name: 'Workspace Administrator', role: 'admin', passwordHash: bcrypt.hashSync(password, 12), status: 'ACTIVE', createdAt: new Date().toISOString() });
-  }
-  if (!db.users.some(user => user.role === 'admin' && user.status === 'ACTIVE')) throw new Error('Production startup requires at least one active workspace administrator.');
-} else if (!db.users.some(user => user.email === demoUser.email)) {
-  db.users.push(demoUser);
-}
-for (const threat of db.threats) if (!Array.isArray(threat.notes)) threat.notes = [];
 let saveQueue = Promise.resolve();
 function persist() {
-  const snapshot = JSON.stringify(db, null, 2);
+  const snapshot = JSON.stringify(db);
   saveQueue = saveQueue.catch(() => {}).then(async () => {
+    if (postgresPool) {
+      await postgresPool.query(
+        'INSERT INTO gravis_workspace_state (id, state) VALUES (1, $1::jsonb) ON CONFLICT (id) DO UPDATE SET state = EXCLUDED.state, updated_at = NOW()',
+        [snapshot]
+      );
+      return;
+    }
     const temporary = `${dataFile}.${process.pid}.tmp`;
-    await fs.promises.writeFile(temporary, snapshot, { mode: 0o600 });
+    await fs.promises.writeFile(temporary, JSON.stringify(db, null, 2), { mode: 0o600 });
     await fs.promises.rename(temporary, dataFile);
   });
   return saveQueue;
@@ -179,7 +198,7 @@ async function addThreat(body, source, user) {
   return threat;
 }
 
-app.get('/api/health', (_req, res) => res.json({ status: 'ok', mode: production ? 'production' : 'demo', storage: 'persistent-json' }));
+app.get('/api/health', (_req, res) => res.json({ status: 'ok', mode: production ? 'production' : 'demo', storage: postgresPool ? 'postgresql' : 'persistent-json' }));
 app.post('/api/auth/login', async (req, res) => {
   const ip = req.ip || 'unknown';
   const window = loginAttempts.get(ip) || { count: 0, resetAt: Date.now() + 15 * 60 * 1000 };
@@ -364,7 +383,27 @@ app.use((err, _req, res, _next) => {
   res.status(500).json({ error: 'Something went wrong. Please try again.' });
 });
 
-server.listen(PORT, () => {
-  persist().catch(error => console.error('Could not save the local data store:', error));
-  console.log(`GRAVIS AI running at http://localhost:${PORT} (${production ? 'production' : 'demo'} mode)`);
+async function startServer() {
+  if (postgresPool) {
+    await postgresPool.query(`
+      CREATE TABLE IF NOT EXISTS gravis_workspace_state (
+        id SMALLINT PRIMARY KEY CHECK (id = 1),
+        state JSONB NOT NULL,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    const result = await postgresPool.query('SELECT state FROM gravis_workspace_state WHERE id = 1');
+    if (result.rows.length) db = prepareDb(result.rows[0].state);
+  }
+  await persist();
+  server.listen(PORT, '0.0.0.0', () => {
+    console.log(`GRAVIS AI running on port ${PORT} (${production ? 'production' : 'demo'} mode)`);
+  });
+}
+
+startServer().catch(async error => {
+  console.error('Could not start GRAVIS AI:', error);
+  if (postgresPool) await postgresPool.end().catch(() => {});
+  process.exitCode = 1;
 });
+
