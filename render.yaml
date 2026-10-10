@@ -1,0 +1,36 @@
+databases:
+  - name: gravis-ai-preview-db
+    databaseName: gravis_ai_preview_db
+    user: gravis_ai_preview_db_user
+    plan: free
+    region: singapore
+    postgresMajorVersion: "18"
+    ipAllowList: []
+
+services:
+  - type: web
+    name: gravis-ai-risk-platform
+    runtime: docker
+    plan: free
+    region: singapore
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: APP_ORIGIN
+        value: https://gravis-ai-risk-platform.onrender.com
+      - key: DATABASE_URL
+        fromDatabase:
+          name: gravis-ai-preview-db
+          property: connectionString
+      - key: JWT_SECRET
+        generateValue: true
+      - key: INGEST_API_KEY
+        generateValue: true
+      - key: INITIAL_ADMIN_EMAIL
+        value: snksys2405@gmail.com
+      - key: INITIAL_ADMIN_PASSWORD
+        sync: false
+
