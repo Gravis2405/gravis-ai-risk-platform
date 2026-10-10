@@ -13,7 +13,7 @@ Requires Node.js 20 or newer.
 
 Local demo sign-in: analyst@gravis.demo / GravisDemo!2026. Change this password before putting real information in the workspace.
 
-Application data is saved in data/gravis.json. Back up this file before moving or replacing it. DATA_FILE can point to a different location.
+In local mode, application data is saved in data/gravis.json. Back up this file before moving or replacing it. DATA_FILE can point to a different location. When DATABASE_URL is set, the app instead stores the workspace state in PostgreSQL.
 
 ## Member accounts
 
@@ -30,14 +30,15 @@ Set these environment variables in the host's secret/configuration panel:
 - APP_ORIGIN=https://your-domain.example (comma-separated HTTPS origins are accepted)
 - JWT_SECRET to a unique random value at least 32 characters long
 - INGEST_API_KEY to a separate unique random value
-- DATA_FILE to a path on the host's durable persistent disk
-- INITIAL_ADMIN_EMAIL and INITIAL_ADMIN_PASSWORD for first startup only, when the data file has no accounts
+- DATA_FILE to a path on the host's durable persistent disk when PostgreSQL is not configured
+- DATABASE_URL to a PostgreSQL connection string when the host provides a database (this takes precedence over DATA_FILE)
+- INITIAL_ADMIN_EMAIL and INITIAL_ADMIN_PASSWORD for first startup only, when the database or data file has no accounts
 
-The first production startup creates an empty workspace and the initial administrator. Once the data file has been created and confirmed, remove the two initial-admin variables from the host configuration. Never deploy the local demo data file.
+The first production startup creates an empty workspace and the initial administrator. Once the first database row or data file has been created and confirmed, remove the two initial-admin variables from the host configuration. Never deploy the local demo data file.
 
-The included Dockerfile builds the app for a container host. Mount a durable writable volume at /var/lib/gravis, provide the production environment variables above, deploy a single instance, and set the exact HTTPS site origin in APP_ORIGIN. Configure the host's health check to GET /api/health. A temporary URL is only available after the host finishes building and starting the service.
+The included Dockerfile builds the app for a container host. Either set DATABASE_URL to a managed PostgreSQL database, or mount a durable writable volume at /var/lib/gravis and set DATA_FILE=/var/lib/gravis/gravis.json. Provide the production environment variables above, deploy a single instance, and set the exact HTTPS site origin in APP_ORIGIN. Configure the host's health check to GET /api/health. A temporary URL is only available after the host finishes building and starting the service.
 
-This release persists data to one JSON file and is suitable only for a single Node process with durable disk attached. It cannot safely support multiple application instances or workers. Use PostgreSQL or another managed database, automated backups, and a migration before scaling or relying on the service for operational data. A hosting plan must keep the service running and retain its persistent disk to meet uptime and data-retention needs.
+The app keeps one shared workspace state in a JSON file or one PostgreSQL JSONB row. It is suitable only for a single Node process and does not support multiple application instances or workers. For long-term operational use, migrate the state to relational tables, configure automated database backups, and review the risk-scoring rules against labeled data. A free hosting plan may sleep while idle or have database expiry limits; choose a plan that meets your uptime and data-retention needs.
 
 ## Current platform scope
 
@@ -60,3 +61,4 @@ The app does not crawl the web or connect to social networks, app stores, phishi
 - GET /api/settings, PATCH /api/settings — settings (admin only for updates).
 - POST /api/threats/ingest — server-to-server ingestion protected by X-Ingest-Key.
 - Socket.IO — authenticated with an auth token; emits new_threat_detected and threat_updated.
+
