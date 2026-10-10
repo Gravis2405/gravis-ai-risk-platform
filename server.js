@@ -85,7 +85,7 @@ function emptyDb() {
 
 let db;
 if (postgresPool) {
-  db = prepareDb(emptyDb());
+  db = emptyDb();
 } else if (fs.existsSync(dataFile)) {
   try {
     db = prepareDb(JSON.parse(fs.readFileSync(dataFile, 'utf8')));
@@ -394,6 +394,7 @@ async function startServer() {
     `);
     const result = await postgresPool.query('SELECT state FROM gravis_workspace_state WHERE id = 1');
     if (result.rows.length) db = prepareDb(result.rows[0].state);
+    else db = prepareDb(emptyDb());
   }
   await persist();
   server.listen(PORT, '0.0.0.0', () => {
