@@ -124,7 +124,7 @@ const channels = new Set(['SOCIAL_MEDIA', 'APP_STORE', 'WEB_LINK', 'BRAND_ASSET'
 const severities = new Set(['CRITICAL', 'HIGH', 'MEDIUM', 'LOW']);
 const statuses = new Set(['DETECTED', 'INVESTIGATING', 'REPORTED', 'RESOLVED']);
 const safeText = (value, max = 180) => typeof value === 'string' ? value.trim().slice(0, max) : '';
-const publicUser = user => ({ email: user.email, name: user.name, role: user.role });
+const publicUser = user => ({ id: user.id, email: user.email, name: user.name, role: user.role });
 function isStrongPassword(value) {
   return typeof value === 'string' && value.length >= 12 && value.length <= 128 && /[a-z]/.test(value) && /[A-Z]/.test(value) && /[0-9]/.test(value) && /[^A-Za-z0-9]/.test(value);
 }
@@ -152,7 +152,7 @@ function authenticate(req, res, next) {
   try {
     const payload = jwt.verify(token, JWT_SECRET, { issuer: 'gravis-ai' });
     const user = db.users.find(row => row.id === payload.sub && row.status === 'ACTIVE');
-    if (!user) return res.status(401).json({ error: 'Your account is not active.' });
+    if (!user || (payload.ver ?? 0) !== (user.tokenVersion ?? 0)) return res.status(401).json({ error: 'Your session is no longer active. Sign in again.' });
     req.user = user;
     next();
   } catch { return res.status(401).json({ error: 'Your session is invalid or expired.' }); }
@@ -190,7 +190,7 @@ function validateThreat(body = {}) {
 }
 async function addThreat(body, source, user) {
   const validated = validateThreat(body);
-  const id = `GR-${String(Date.now()).slice(-6)}${crypto.randomInt(10, 99)}`;
+  const id = `GR-${crypto.randomUUID().replaceAll('-', '').slice(0, 20).toUpperCase()}`;
   const threat = { id, ...validated, source, status: 'DETECTED', notes: [], detectedAt: new Date().toISOString(), createdBy: user?.name || 'Ingestion API' };
   db.threats.unshift(threat);
   await persist();
@@ -198,7 +198,13 @@ async function addThreat(body, source, user) {
   return threat;
 }
 
-app.get('/api/health', (_req, res) => res.json({ status: 'ok', mode: production ? 'production' : 'demo', storage: postgresPool ? 'postgresql' : 'persistent-json' }));
+app.get('/api/health', async (_req, res) => {
+  if (postgresPool) {
+    try { await postgresPool.query('SELECT 1'); }
+    catch { return res.status(503).json({ status: 'unavailable', mode: production ? 'production' : 'demo', storage: 'postgresql' }); }
+  }
+  res.json({ status: 'ok', mode: production ? 'production' : 'demo', storage: postgresPool ? 'postgresql' : 'persistent-json' });
+});
 app.post('/api/auth/login', async (req, res) => {
   const ip = req.ip || 'unknown';
   const window = loginAttempts.get(ip) || { count: 0, resetAt: Date.now() + 15 * 60 * 1000 };
@@ -212,7 +218,7 @@ app.post('/api/auth/login', async (req, res) => {
     return res.status(401).json({ error: 'Email or password is incorrect.' });
   }
   loginAttempts.delete(ip);
-  const token = jwt.sign({ sub: user.id, role: user.role }, JWT_SECRET, { expiresIn: '8h', issuer: 'gravis-ai' });
+  const token = jwt.sign({ sub: user.id, role: user.role, ver: user.tokenVersion ?? 0 }, JWT_SECRET, { expiresIn: '8h', issuer: 'gravis-ai' });
   res.json({ token, user: publicUser(user) });
 });
 app.post('/api/auth/register', async (req, res) => {
@@ -220,7 +226,7 @@ app.post('/api/auth/register', async (req, res) => {
   const name = safeText(req.body?.name, 100);
   const email = safeText(req.body?.email, 254).toLowerCase();
   const password = req.body?.password;
-  if (!name || !/^\S+@\S+\.\S+$/.test(email) || typeof password !== 'string' || password.length < 12 || !/[a-z]/.test(password) || !/[A-Z]/.test(password) || !/[0-9]/.test(password) || !/[^A-Za-z0-9]/.test(password)) return res.status(422).json({ error: 'Use a valid email and a 12-character password with upper, lower, number, and symbol.' });
+  if (!name || !/^\S+@\S+\.\S+$/.test(email) || !isStrongPassword(password)) return res.status(422).json({ error: 'Use a valid email and a 12–128 character password with upper, lower, number, and symbol.' });
   if (db.users.some(user => user.email === email) || db.registrations.some(user => user.email === email)) return res.status(409).json({ error: 'An account with that email already exists.' });
   db.registrations.push({ id: crypto.randomUUID(), name, email, passwordHash: await bcrypt.hash(password, 12), status: 'PENDING_VERIFICATION', createdAt: new Date().toISOString() });
   await persist();
@@ -231,10 +237,17 @@ app.post('/api/auth/change-password', authenticate, async (req, res) => {
   const current = req.body?.currentPassword;
   const next = req.body?.newPassword;
   if (typeof current !== 'string' || !(await bcrypt.compare(current, req.user.passwordHash))) return res.status(401).json({ error: 'Current password is incorrect.' });
-  if (typeof next !== 'string' || next.length < 12 || !/[a-z]/.test(next) || !/[A-Z]/.test(next) || !/[0-9]/.test(next) || !/[^A-Za-z0-9]/.test(next)) return res.status(422).json({ error: 'Use a 12-character password with upper, lower, number, and symbol.' });
+  if (!isStrongPassword(next)) return res.status(422).json({ error: 'Use a 12–128 character password with upper, lower, number, and symbol.' });
   req.user.passwordHash = await bcrypt.hash(next, 12);
+  req.user.tokenVersion = (req.user.tokenVersion ?? 0) + 1;
   await persist();
-  res.json({ message: 'Password updated. Sign in again on your next session.' });
+  for (const socket of io.sockets.sockets.values()) {
+    if (socket.data.userId === req.user.id) {
+      socket.emit('session_invalid', { message: 'Your password changed. Sign in again to continue.' });
+      socket.disconnect(true);
+    }
+  }
+  res.json({ message: 'Password updated. Sign in again to continue.' });
 });
 
 app.get('/api/dashboard/summary', authenticate, (_req, res) => res.json(summary()));
@@ -341,8 +354,9 @@ app.post('/api/users', authenticate, requireAdmin, async (req, res) => {
   const name = safeText(req.body?.name, 100);
   const email = safeText(req.body?.email, 254).toLowerCase();
   const password = req.body?.password;
-  const role = req.body?.role === 'admin' ? 'admin' : 'analyst';
+  const role = req.body?.role === undefined ? 'analyst' : req.body.role;
   if (!name || !/^\S+@\S+\.\S+$/.test(email)) return res.status(422).json({ error: 'Provide a name and valid email address.' });
+  if (!['admin', 'analyst'].includes(role)) return res.status(422).json({ error: 'Choose a valid workspace role.' });
   if (!isStrongPassword(password)) return res.status(422).json({ error: 'Use a 12–128 character password with upper, lower, number, and symbol.' });
   if (db.users.some(user => user.email === email) || db.registrations.some(user => user.email === email)) return res.status(409).json({ error: 'An account with that email already exists.' });
   const user = { id: crypto.randomUUID(), name, email, role, passwordHash: await bcrypt.hash(password, 12), status: 'ACTIVE', createdAt: new Date().toISOString() };
@@ -359,9 +373,18 @@ app.patch('/api/users/:id', authenticate, requireAdmin, async (req, res) => {
   if (user.id === req.user.id && (nextRole !== 'admin' || nextStatus !== 'ACTIVE')) return res.status(422).json({ error: 'You cannot remove administrator access or disable your own account.' });
   const removesActiveAdmin = user.role === 'admin' && user.status === 'ACTIVE' && (nextRole !== 'admin' || nextStatus !== 'ACTIVE');
   if (removesActiveAdmin && db.users.filter(row => row.role === 'admin' && row.status === 'ACTIVE').length <= 1) return res.status(409).json({ error: 'The workspace must retain at least one active administrator.' });
+  const accessChanged = user.role !== nextRole || user.status !== nextStatus;
   user.role = nextRole;
   user.status = nextStatus;
   await persist();
+  if (accessChanged) {
+    for (const socket of io.sockets.sockets.values()) {
+      if (socket.data.userId === user.id) {
+        socket.emit('session_invalid', { message: 'Your workspace access changed. Sign in again to continue.' });
+        socket.disconnect(true);
+      }
+    }
+  }
   res.json(userListItem(user));
 });
 
@@ -369,12 +392,31 @@ io.use((socket, next) => {
   try {
     const payload = jwt.verify(socket.handshake.auth?.token || '', JWT_SECRET, { issuer: 'gravis-ai' });
     const user = db.users.find(row => row.id === payload.sub && row.status === 'ACTIVE');
-    if (!user) return next(new Error('Authentication required'));
+    if (!user || (payload.ver ?? 0) !== (user.tokenVersion ?? 0)) return next(new Error('Authentication required'));
     socket.user = publicUser(user);
+    socket.data.userId = user.id;
+    socket.data.expiresAt = payload.exp ? payload.exp * 1000 : null;
     next();
   } catch { next(new Error('Authentication required')); }
 });
-io.on('connection', socket => socket.emit('stream_ready', { connected: true }));
+io.on('connection', socket => {
+  const expiry = socket.data.expiresAt;
+  if (expiry) {
+    const delay = expiry - Date.now();
+    if (delay <= 0) {
+      socket.emit('session_invalid', { message: 'Your session expired. Sign in again.' });
+      socket.disconnect(true);
+      return;
+    }
+    const expiryTimer = setTimeout(() => {
+      socket.emit('session_invalid', { message: 'Your session expired. Sign in again.' });
+      socket.disconnect(true);
+    }, delay);
+    expiryTimer.unref?.();
+    socket.once('disconnect', () => clearTimeout(expiryTimer));
+  }
+  socket.emit('stream_ready', { connected: true });
+});
 app.use('/api', (_req, res) => res.status(404).json({ error: 'API endpoint not found.' }));
 app.use((err, _req, res, _next) => {
   if (err.type === 'entity.parse.failed') return res.status(400).json({ error: 'Request body must contain valid JSON.' });
@@ -407,4 +449,3 @@ startServer().catch(async error => {
   if (postgresPool) await postgresPool.end().catch(() => {});
   process.exitCode = 1;
 });
-

@@ -44,14 +44,14 @@ The app keeps one shared workspace state in a JSON file or one PostgreSQL JSONB 
 
 - Analysts can add threat records, update case statuses, write notes, track brand assets, review aggregate analytics, and export CSV.
 - Administrators can manage workspace settings and member accounts.
-- Passwords are hashed. API sessions use eight-hour signed tokens. Login attempts are throttled in each server process.
+- Passwords are hashed. API sessions use eight-hour signed tokens; changing a password invalidates earlier tokens. Disabling an account or changing its role closes its live-update session. Login attempts are throttled in each server process.
 - Newly added and updated records are broadcast to authenticated sessions in the same workspace.
 
 The app does not crawl the web or connect to social networks, app stores, phishing feeds, email delivery, identity verification, or an operational alerting service. Brand assets organize a tracking list only. Seeded sample URLs use the reserved .example domain. Risk scores are baseline rules and need evaluation against labeled threat data before operational decisions depend on them.
 
 ## API
 
-- GET /api/health — service status.
+- GET /api/health — service status and PostgreSQL connectivity when a database is configured.
 - POST /api/auth/login, GET /api/auth/me, POST /api/auth/change-password — sign-in and account details.
 - GET /api/users, POST /api/users, PATCH /api/users/:id — administrator-only member management.
 - GET /api/dashboard/summary, GET /api/threats, GET /api/threats/:id — workspace dashboard and investigations.
@@ -61,4 +61,3 @@ The app does not crawl the web or connect to social networks, app stores, phishi
 - GET /api/settings, PATCH /api/settings — settings (admin only for updates).
 - POST /api/threats/ingest — server-to-server ingestion protected by X-Ingest-Key.
 - Socket.IO — authenticated with an auth token; emits new_threat_detected and threat_updated.
-

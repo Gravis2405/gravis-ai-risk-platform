@@ -27,6 +27,17 @@ function toast(message, isError = false) {
   clearTimeout(state.toastTimer);
   state.toastTimer = setTimeout(() => element.classList.remove('show'), 3000);
 }
+async function loadModeIndicator() {
+  const label = $('#mode-indicator-label');
+  try {
+    const response = await fetch('/api/health');
+    if (!response.ok) throw new Error('Health check unavailable');
+    const health = await response.json();
+    label.textContent = health.mode === 'production' ? 'PRODUCTION' : 'DEMO DATA';
+  } catch {
+    label.textContent = 'WORKSPACE';
+  }
+}
 function authHeaders() {
   return { 'Content-Type': 'application/json', ...(state.token ? { Authorization: `Bearer ${state.token}` } : {}) };
 }
@@ -37,7 +48,7 @@ async function api(path, options = {}) {
     state.token = '';
     localStorage.removeItem('gravis_token');
     state.socket?.disconnect();
-    $('#login-dialog').showModal();
+    if (!$('#login-dialog').open) $('#login-dialog').showModal();
     throw new Error(data.error || 'Sign in required');
   }
   if (!response.ok) throw new Error(data.error || 'Request failed');
@@ -114,9 +125,10 @@ function renderOverview() {
     return segment;
   });
   $('.donut').style.background = `conic-gradient(${segments.join(',')})`;
-  const recent = [...state.threats].filter(threat => state.homeFilter === 'ALL' || threat.severity === state.homeFilter).sort((a, b) => new Date(b.detectedAt) - new Date(a.detectedAt)).slice(0, 6);
+  const filtered = [...state.threats].filter(threat => state.homeFilter === 'ALL' || threat.severity === state.homeFilter).sort((a, b) => new Date(b.detectedAt) - new Date(a.detectedAt));
+  const recent = filtered.slice(0, 6);
   renderRows('#threat-rows', recent);
-  $('#result-count').textContent = `Showing ${Math.min(state.threats.length, 6)} of ${state.threats.length} records`;
+  $('#result-count').textContent = `Showing ${recent.length} of ${filtered.length} records`;
   const channelOrder = ['SOCIAL_MEDIA', 'WEB_LINK', 'APP_STORE', 'BRAND_ASSET'];
   const channelCounts = channelOrder.map(channel => state.threats.filter(threat => threat.channel === channel).length);
   const largest = Math.max(1, ...channelCounts);
@@ -200,9 +212,12 @@ async function loadInitial() {
       api('/api/auth/me'), api('/api/dashboard/summary'), api('/api/threats'), api('/api/brands'), api('/api/settings')
     ]);
     setProfile(user);
-    $('#users-admin-only').hidden = user.role !== 'admin';
-    $('#users-readonly').hidden = user.role === 'admin';
-    if (user.role === 'admin') await loadUsers();
+    const isAdmin = user.role === 'admin';
+    $$('[data-admin-only-settings]').forEach(card => { card.hidden = !isAdmin; });
+    $('#settings-admin-readonly').hidden = isAdmin;
+    $('#users-admin-only').hidden = !isAdmin;
+    $('#users-readonly').hidden = isAdmin;
+    if (isAdmin) await loadUsers();
     state.summary = summary;
     state.threats = threats;
     state.assets = assets;
@@ -230,8 +245,34 @@ function connectSocket() {
     renderAll();
     if (state.selectedThreatId === threat.id) renderThreatDetail(threat);
   });
-  state.socket.on('connect_error', () => {
-    if (state.token) toast('Live updates are unavailable. Refresh to reconnect.', true);
+  state.socket.on('connect_error', error => {
+    if (!state.token) return;
+    if (error.message === 'Authentication required') {
+      state.token = '';
+      localStorage.removeItem('gravis_token');
+      state.socket?.disconnect();
+      const dialog = $('#login-dialog');
+      if (!dialog.open) dialog.showModal();
+      $('#login-error').textContent = 'Your session expired or account is inactive. Sign in again.';
+      return;
+    }
+    toast('Live updates are unavailable. Refresh to reconnect.', true);
+  });
+  state.socket.on('session_invalid', event => {
+    state.token = '';
+    localStorage.removeItem('gravis_token');
+    state.socket?.disconnect();
+    const dialog = $('#login-dialog');
+    if (!dialog.open) dialog.showModal();
+    $('#login-error').textContent = event?.message || 'Your session ended. Sign in again.';
+  });
+  state.socket.on('disconnect', reason => {
+    if (reason !== 'io server disconnect' || !state.token) return;
+    state.token = '';
+    localStorage.removeItem('gravis_token');
+    const dialog = $('#login-dialog');
+    if (!dialog.open) dialog.showModal();
+    $('#login-error').textContent = 'Your workspace access changed. Sign in again to continue.';
   });
 }
 async function loadSummary() {
@@ -249,6 +290,14 @@ function showView(name) {
   $('#page-crumb').textContent = labels[view];
   if (view === 'analytics' && state.token) loadAnalytics();
   if (view === 'threats') renderQueue();
+}
+function setMobileNavOpen(open) {
+  const sidebar = $('#workspace-sidebar');
+  const toggle = $('#mobile-nav-toggle');
+  sidebar.classList.toggle('expanded', open);
+  toggle.setAttribute('aria-expanded', String(open));
+  toggle.setAttribute('aria-label', open ? 'Close navigation' : 'Open navigation');
+  toggle.textContent = open ? '×' : '☰';
 }
 async function updateStatus(id, status) {
   if (!statusNames[status]) return;
@@ -320,7 +369,15 @@ $$('[data-view]').forEach(element => element.addEventListener('click', event => 
   event.preventDefault();
   showView(element.dataset.view);
   if (element.tagName === 'A') history.replaceState(null, '', `#${element.dataset.view}`);
+  setMobileNavOpen(false);
 }));
+$('#mobile-nav-toggle').addEventListener('click', () => setMobileNavOpen(!$('#workspace-sidebar').classList.contains('expanded')));
+$('#main-content').addEventListener('click', () => {
+  if ($('#workspace-sidebar').classList.contains('expanded')) setMobileNavOpen(false);
+});
+document.addEventListener('keydown', event => {
+  if (event.key === 'Escape' && $('#workspace-sidebar').classList.contains('expanded')) setMobileNavOpen(false);
+});
 $$('[data-open-investigation]').forEach(button => button.addEventListener('click', () => $('#investigation-dialog').showModal()));
 $$('[data-close-dialog]').forEach(button => button.addEventListener('click', () => $(`#${button.dataset.closeDialog}`).close()));
 $('#export-btn').addEventListener('click', () => exportThreats());
@@ -389,7 +446,7 @@ $('#investigation-form').addEventListener('submit', async event => {
   if (submit) submit.disabled = true;
   try {
     const threat = await api('/api/threats', { method: 'POST', body: JSON.stringify(payload) });
-    state.threats.unshift(threat);
+    state.threats = [threat, ...state.threats.filter(item => item.id !== threat.id)];
     state.summary = await api('/api/dashboard/summary');
     renderAll();
     event.currentTarget.reset();
@@ -473,9 +530,14 @@ $('#password-form').addEventListener('submit', async event => {
   try {
     await api('/api/auth/change-password', { method: 'POST', body: JSON.stringify({ currentPassword: values.get('currentPassword'), newPassword: values.get('newPassword') }) });
     event.currentTarget.reset();
-    $('#password-save-state').textContent = 'Updated';
+    $('#password-save-state').textContent = 'Updated · sign in again';
     setTimeout(() => { $('#password-save-state').textContent = ''; }, 2500);
-    toast('Password updated.');
+    state.token = '';
+    localStorage.removeItem('gravis_token');
+    state.socket?.disconnect();
+    const dialog = $('#login-dialog');
+    if (!dialog.open) dialog.showModal();
+    $('#login-error').textContent = 'Password updated. Sign in again to continue.';
   } catch (error) { toast(error.message, true); }
   finally { button.disabled = false; }
 });
@@ -508,4 +570,5 @@ $('#users-list').addEventListener('click', event => {
 $('#threat-dialog').addEventListener('close', () => { state.selectedThreatId = null; });
 
 if (location.hash.startsWith('#')) showView(location.hash.slice(1));
+loadModeIndicator();
 loadInitial();
