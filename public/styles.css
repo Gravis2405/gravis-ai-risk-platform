@@ -22,3 +22,15 @@
   .sidebar.expanded .user-profile .icon-button{display:block}
   .sidebar.expanded .user-profile{justify-content:flex-start}
 }
+
+.signout-button{display:inline-flex;align-items:center;justify-content:center;gap:7px;min-height:34px;padding:0 10px;border:1px solid #e6ebe8;border-radius:7px;background:#fff;color:#56675f;font:600 10px var(--body);cursor:pointer;white-space:nowrap;transition:background .15s,border-color .15s,color .15s}
+.signout-button>span:first-child{font-size:16px;line-height:1}
+.signout-button:hover{border-color:#f0cccc;background:#fff6f5;color:#a84343}
+.signout-button:focus-visible{outline:3px solid #63ba8c;outline-offset:2px}
+@media(max-width:900px){
+  .sidebar:not(.expanded) .user-profile{flex-direction:column;gap:8px;padding-top:10px}
+  .sidebar:not(.expanded) .signout-button{width:38px;height:38px;padding:0;border:0;background:transparent}
+  .sidebar:not(.expanded) .signout-button:hover{background:#fff2f1}
+  .sidebar:not(.expanded) .signout-label{display:none}
+  .sidebar.expanded .signout-button{padding:0 9px}
+}
