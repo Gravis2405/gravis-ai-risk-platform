@@ -6,6 +6,8 @@ const state = {
   assets: [],
   summary: {},
   settings: null,
+  accountSecurity: null,
+  pendingLogin: null,
   homeFilter: 'ALL',
   selectedThreatId: null,
   socket: null,
@@ -179,16 +181,41 @@ function updateSettingsForm(settings) {
   $('#settings-workspace-name').value = settings.workspaceName;
   $('#settings-timezone').value = settings.timezone || 'Asia/Kolkata';
   for (const checkbox of $$('#notifications-form input[type="checkbox"]')) checkbox.checked = Boolean(settings.notifications[checkbox.name]);
+  $('#policy-phone-enabled').checked = Boolean(settings.security?.phoneOtpEnabled);
+  $('#policy-passkey-enabled').checked = Boolean(settings.security?.passkeyEnabled);
+  $('#policy-phone-enabled').disabled = !settings.capabilities?.phoneOtpAvailable && !settings.security?.phoneOtpEnabled;
+  $('#sms-provider-status').textContent = settings.capabilities?.phoneOtpAvailable
+    ? 'Twilio Verify is configured and ready for phone checks.'
+    : 'Twilio Verify is not configured on the server. Add its credentials there before enabling SMS verification.';
   updateWorkspaceName(settings.workspaceName);
+}
+function renderAccountSecurity(details) {
+  state.accountSecurity = details;
+  const phoneStatus = $('#phone-verification-status');
+  phoneStatus.textContent = details.phoneVerified ? `Verified phone: ${details.phoneNumber}` : 'No verified phone number is linked to this account.';
+  const phoneAvailable = details.capabilities?.phoneOtpAvailable && details.policy?.phoneOtpEnabled;
+  $('#phone-number-input').disabled = !phoneAvailable;
+  $('#send-phone-code').disabled = !phoneAvailable;
+  $('#send-phone-code').textContent = details.capabilities?.phoneOtpAvailable ? (details.policy?.phoneOtpEnabled ? 'Send verification code' : 'Phone verification is disabled') : 'SMS provider not configured';
+  $('#phone-enroll-controls').hidden = details.phoneVerified;
+  $('#remove-phone').hidden = !details.phoneVerified;
+  $('#passkey-availability').textContent = details.policy?.passkeyEnabled ? 'Passkey sign-in is enabled by the administrator.' : 'Passkeys are not enabled by the administrator.';
+  $('#add-passkey').disabled = !details.capabilities?.passkeyAvailable || !details.policy?.passkeyEnabled;
+  const list = $('#passkey-list');
+  list.innerHTML = details.passkeys.length ? details.passkeys.map(item => `<div class="passkey-row"><span><b>${escapeHtml(item.name || 'Device passkey')}</b><small>Added ${new Date(item.createdAt).toLocaleDateString()}</small></span><button class="member-access-button" type="button" data-remove-passkey="${safeId(item.id)}">Remove</button></div>`).join('') : '<p class="security-help">No passkeys are registered.</p>';
+}
+async function loadAccountSecurity() {
+  renderAccountSecurity(await api('/api/auth/security'));
 }
 function renderUsers() {
   const target = $('#users-list');
   if (!target) return;
   if (!state.users.length) { target.innerHTML = '<p class="member-empty">No member accounts found.</p>'; return; }
-  target.innerHTML = '<div class="users-table-wrap"><table class="users-table"><thead><tr><th>MEMBER</th><th>ROLE</th><th>ACCESS</th><th></th></tr></thead><tbody>' + state.users.map(user => {
+  target.innerHTML = '<div class="users-table-wrap"><table class="users-table"><thead><tr><th>MEMBER</th><th>ROLE</th><th>VERIFICATION</th><th>ACCESS</th><th></th></tr></thead><tbody>' + state.users.map(user => {
     const id = safeId(user.id);
     const self = user.id === state.user?.id;
-    return '<tr><td><b>' + escapeHtml(user.name) + '</b><small>' + escapeHtml(user.email) + (self ? ' · you' : '') + '</small></td><td><select data-user-role="' + id + '" aria-label="Role for ' + escapeHtml(user.name) + '"' + (self ? ' disabled' : '') + '><option value="analyst"' + (user.role === 'analyst' ? ' selected' : '') + '>Analyst</option><option value="admin"' + (user.role === 'admin' ? ' selected' : '') + '>Admin</option></select></td><td><span class="member-status ' + (user.status === 'ACTIVE' ? 'member-active' : 'member-disabled') + '">' + (user.status === 'ACTIVE' ? 'Active' : 'Disabled') + '</span></td><td><button class="member-access-button" data-toggle-user="' + id + '"' + (self ? ' disabled' : '') + '>' + (user.status === 'ACTIVE' ? 'Disable' : 'Enable') + '</button></td></tr>';
+    const verification = `${user.phoneVerified ? 'Phone verified' : 'Phone not set'} · ${user.passkeyCount || 0} passkeys`;
+    return '<tr><td><b>' + escapeHtml(user.name) + '</b><small>' + escapeHtml(user.email) + (self ? ' · you' : '') + '</small></td><td><select data-user-role="' + id + '" aria-label="Role for ' + escapeHtml(user.name) + '"' + (self ? ' disabled' : '') + '><option value="analyst"' + (user.role === 'analyst' ? ' selected' : '') + '>Analyst</option><option value="admin"' + (user.role === 'admin' ? ' selected' : '') + '>Admin</option></select></td><td><small>' + verification + '</small></td><td><span class="member-status ' + (user.status === 'ACTIVE' ? 'member-active' : 'member-disabled') + '">' + (user.status === 'ACTIVE' ? 'Active' : 'Disabled') + '</span></td><td><button class="member-access-button" data-toggle-user="' + id + '"' + (self ? ' disabled' : '') + '>' + (user.status === 'ACTIVE' ? 'Disable' : 'Enable') + '</button></td></tr>';
   }).join('') + '</tbody></table></div>';
 }
 async function loadUsers() {
@@ -208,8 +235,8 @@ async function changeUserAccess(id, changes) {
 async function loadInitial() {
   if (!state.token) { $('#login-dialog').showModal(); return; }
   try {
-    const [user, summary, threats, assets, settings] = await Promise.all([
-      api('/api/auth/me'), api('/api/dashboard/summary'), api('/api/threats'), api('/api/brands'), api('/api/settings')
+    const [user, summary, threats, assets, settings, accountSecurity] = await Promise.all([
+      api('/api/auth/me'), api('/api/dashboard/summary'), api('/api/threats'), api('/api/brands'), api('/api/settings'), api('/api/auth/security')
     ]);
     setProfile(user);
     const isAdmin = user.role === 'admin';
@@ -222,6 +249,7 @@ async function loadInitial() {
     state.threats = threats;
     state.assets = assets;
     updateSettingsForm(settings);
+    renderAccountSecurity(accountSecurity);
     $('#today-label').textContent = new Date().toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' }).toUpperCase();
     renderAll();
     if ($('.workspace-view.active')?.dataset.viewPanel === 'analytics') loadAnalytics();
@@ -413,6 +441,58 @@ document.addEventListener('change', event => {
   if (statusSelect) updateStatus(statusSelect.dataset.statusId, statusSelect.value);
 });
 
+function decodeBase64url(value) {
+  const base64 = String(value).replace(/-/g, '+').replace(/_/g, '/');
+  const binary = atob(base64 + '='.repeat((4 - base64.length % 4) % 4));
+  return Uint8Array.from(binary, character => character.charCodeAt(0));
+}
+function encodeBase64url(value) {
+  const bytes = new Uint8Array(value);
+  let binary = '';
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+}
+function publicKeyOptions(options, registration = false) {
+  const converted = { ...options, challenge: decodeBase64url(options.challenge) };
+  if (registration) converted.user = { ...options.user, id: decodeBase64url(options.user.id) };
+  for (const name of ['allowCredentials', 'excludeCredentials']) {
+    if (options[name]) converted[name] = options[name].map(item => ({ ...item, id: decodeBase64url(item.id) }));
+  }
+  return converted;
+}
+function credentialPayload(credential) {
+  const response = credential.response;
+  const result = { id: credential.id, rawId: encodeBase64url(credential.rawId), type: credential.type, authenticatorAttachment: credential.authenticatorAttachment, clientExtensionResults: credential.getClientExtensionResults() };
+  if ('attestationObject' in response) {
+    result.response = { clientDataJSON: encodeBase64url(response.clientDataJSON), attestationObject: encodeBase64url(response.attestationObject), transports: response.getTransports?.() || [] };
+  } else {
+    result.response = { authenticatorData: encodeBase64url(response.authenticatorData), clientDataJSON: encodeBase64url(response.clientDataJSON), signature: encodeBase64url(response.signature), userHandle: response.userHandle ? encodeBase64url(response.userHandle) : null };
+  }
+  return result;
+}
+function showLoginChallenge(data) {
+  state.pendingLogin = { challengeId: data.challengeId, requiredFactors: data.requiredFactors, verifiedFactors: data.verifiedFactors || [] };
+  $('#login-form').hidden = true;
+  $('#login-factor-step').hidden = false;
+  const phonePending = data.requiredFactors.includes('phone') && !state.pendingLogin.verifiedFactors.includes('phone');
+  const passkeyPending = data.requiredFactors.includes('passkey') && !state.pendingLogin.verifiedFactors.includes('passkey');
+  $('#login-phone-factor').hidden = !phonePending;
+  $('#login-passkey-button').hidden = !passkeyPending;
+  $('#login-factor-instructions').textContent = [phonePending ? 'Enter the code sent to your verified phone.' : '', passkeyPending ? 'Use a registered passkey on this device.' : ''].filter(Boolean).join(' ');
+  $('#login-verification-error').textContent = '';
+}
+async function acceptLoginResult(data) {
+  if (!data.token) { showLoginChallenge(data); return; }
+  state.pendingLogin = null;
+  state.token = data.token;
+  localStorage.setItem('gravis_token', data.token);
+  $('#login-factor-step').hidden = true;
+  $('#login-form').hidden = false;
+  $('#login-form').reset();
+  $('#login-dialog').close();
+  await loadInitial();
+}
+
 $('#login-form').addEventListener('submit', async event => {
   event.preventDefault();
   const values = new FormData(event.currentTarget);
@@ -421,12 +501,41 @@ $('#login-form').addEventListener('submit', async event => {
   if (submit) submit.disabled = true;
   try {
     const data = await api('/api/auth/login', { method: 'POST', body: JSON.stringify({ email: values.get('email'), password: values.get('password') }) });
-    state.token = data.token;
-    localStorage.setItem('gravis_token', data.token);
-    $('#login-dialog').close();
-    await loadInitial();
+    await acceptLoginResult(data);
   } catch (error) { $('#login-error').textContent = error.message; }
   finally { if (submit) submit.disabled = false; }
+});
+$('#submit-login-phone-code').addEventListener('click', async () => {
+  if (!state.pendingLogin) return;
+  const button = $('#submit-login-phone-code');
+  button.disabled = true;
+  $('#login-verification-error').textContent = '';
+  try {
+    const data = await api('/api/auth/login/phone-check', { method: 'POST', body: JSON.stringify({ challengeId: state.pendingLogin.challengeId, code: $('#login-phone-code').value.trim() }) });
+    await acceptLoginResult(data);
+  } catch (error) { $('#login-verification-error').textContent = error.message; }
+  finally { button.disabled = false; }
+});
+$('#login-passkey-button').addEventListener('click', async () => {
+  if (!state.pendingLogin || !window.PublicKeyCredential || !navigator.credentials?.get) { $('#login-verification-error').textContent = 'Passkeys are not supported by this browser.'; return; }
+  const button = $('#login-passkey-button');
+  button.disabled = true;
+  $('#login-verification-error').textContent = '';
+  try {
+    const options = await api('/api/auth/login/passkey-options', { method: 'POST', body: JSON.stringify({ challengeId: state.pendingLogin.challengeId }) });
+    const credential = await navigator.credentials.get({ publicKey: publicKeyOptions(options) });
+    if (!credential) throw new Error('Passkey verification was cancelled.');
+    const data = await api('/api/auth/login/passkey-check', { method: 'POST', body: JSON.stringify({ challengeId: state.pendingLogin.challengeId, ...credentialPayload(credential) }) });
+    await acceptLoginResult(data);
+  } catch (error) { $('#login-verification-error').textContent = error.message || 'Passkey verification failed.'; }
+  finally { button.disabled = false; }
+});
+$('#restart-login').addEventListener('click', () => {
+  state.pendingLogin = null;
+  $('#login-factor-step').hidden = true;
+  $('#login-form').hidden = false;
+  $('#login-form').reset();
+  $('#login-error').textContent = '';
 });
 $('#signout').addEventListener('click', () => {
   state.socket?.disconnect();
@@ -521,6 +630,81 @@ $('#notifications-form').addEventListener('submit', async event => {
     toast('Notification preferences saved.');
   } catch (error) { toast(error.message, true); }
   finally { button.disabled = false; }
+});
+$('#security-policy-form').addEventListener('submit', async event => {
+  event.preventDefault();
+  const button = event.currentTarget.querySelector('button');
+  button.disabled = true;
+  const security = { phoneOtpEnabled: $('#policy-phone-enabled').checked, passkeyEnabled: $('#policy-passkey-enabled').checked };
+  try {
+    const settings = await api('/api/settings', { method: 'PATCH', body: JSON.stringify({ workspaceName: $('#settings-workspace-name').value.trim(), notifications: state.settings.notifications, security }) });
+    updateSettingsForm(settings);
+    await loadAccountSecurity();
+    $('#security-policy-state').textContent = 'Saved';
+    setTimeout(() => { $('#security-policy-state').textContent = ''; }, 2500);
+    toast('Verification policy saved.');
+  } catch (error) { toast(error.message, true); }
+  finally { button.disabled = false; }
+});
+$('#send-phone-code').addEventListener('click', async () => {
+  const button = $('#send-phone-code');
+  button.disabled = true;
+  $('#account-security-state').textContent = '';
+  try {
+    await api('/api/auth/phone/send', { method: 'POST', body: JSON.stringify({ phoneNumber: $('#phone-number-input').value.trim() }) });
+    $('#phone-code-controls').hidden = false;
+    $('#phone-code-input').focus();
+    $('#account-security-state').textContent = 'Code sent. It expires in 10 minutes.';
+  } catch (error) { $('#account-security-state').textContent = error.message; }
+  finally { button.disabled = !state.accountSecurity?.capabilities?.phoneOtpAvailable || !state.accountSecurity?.policy?.phoneOtpEnabled; }
+});
+$('#verify-phone-code').addEventListener('click', async () => {
+  const button = $('#verify-phone-code');
+  button.disabled = true;
+  try {
+    await api('/api/auth/phone/check', { method: 'POST', body: JSON.stringify({ code: $('#phone-code-input').value.trim() }) });
+    $('#phone-code-controls').hidden = true;
+    $('#phone-number-input').value = '';
+    await loadAccountSecurity();
+    if (state.user?.role === 'admin') await loadUsers();
+    $('#account-security-state').textContent = 'Phone number verified.';
+  } catch (error) { $('#account-security-state').textContent = error.message; }
+  finally { button.disabled = false; }
+});
+$('#remove-phone').addEventListener('click', async () => {
+  try {
+    await api('/api/auth/phone', { method: 'DELETE' });
+    await loadAccountSecurity();
+    if (state.user?.role === 'admin') await loadUsers();
+    $('#account-security-state').textContent = 'Verified phone removed.';
+  } catch (error) { toast(error.message, true); }
+});
+$('#add-passkey').addEventListener('click', async () => {
+  const button = $('#add-passkey');
+  if (!window.PublicKeyCredential || !navigator.credentials?.create) { $('#account-security-state').textContent = 'This browser does not support device passkeys.'; return; }
+  button.disabled = true;
+  $('#account-security-state').textContent = '';
+  try {
+    const options = await api('/api/auth/passkeys/register-options', { method: 'POST', body: JSON.stringify({}) });
+    const credential = await navigator.credentials.create({ publicKey: publicKeyOptions(options, true) });
+    if (!credential) throw new Error('Passkey setup was cancelled.');
+    await api('/api/auth/passkeys/register', { method: 'POST', body: JSON.stringify({ ...credentialPayload(credential), name: 'Device passkey' }) });
+    await loadAccountSecurity();
+    if (state.user?.role === 'admin') await loadUsers();
+    $('#account-security-state').textContent = 'Passkey added to your account.';
+  } catch (error) { $('#account-security-state').textContent = error.message || 'Passkey setup failed.'; }
+  finally { button.disabled = !state.accountSecurity?.capabilities?.passkeyAvailable || !state.accountSecurity?.policy?.passkeyEnabled; }
+});
+$('#passkey-list').addEventListener('click', async event => {
+  const button = event.target.closest('[data-remove-passkey]');
+  if (!button) return;
+  button.disabled = true;
+  try {
+    await api(`/api/auth/passkeys/${encodeURIComponent(button.dataset.removePasskey)}`, { method: 'DELETE' });
+    await loadAccountSecurity();
+    if (state.user?.role === 'admin') await loadUsers();
+    $('#account-security-state').textContent = 'Passkey removed.';
+  } catch (error) { toast(error.message, true); button.disabled = false; }
 });
 $('#password-form').addEventListener('submit', async event => {
   event.preventDefault();

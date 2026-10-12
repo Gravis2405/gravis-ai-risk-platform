@@ -21,6 +21,16 @@ Sign in as a workspace administrator, open **Settings → Workspace members**, a
 
 Analysts can work with the shared workspace records. This starter does not provide separate customer tenants or per-record permissions.
 
+## Phone verification and passkeys
+
+Administrators can enable SMS verification and passkey sign-in in **Settings → Verification policy**. Analysts and administrators can enroll their own verified phone number or device passkeys in **Settings → My verification methods**. Only enrolled accounts receive the corresponding extra sign-in check. The workspace toggle can disable either method without deleting member enrollment.
+
+To enable SMS, create a Twilio Verify service, then set `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, and `TWILIO_VERIFY_SERVICE_SID` as server-side secrets. Restart or redeploy the service after saving them. Do not put these credentials in browser code or share them in chat. Phone numbers must use E.164 format, such as `+14155550123`.
+
+Passkeys require a supported browser and a secure HTTPS origin (localhost is also accepted by browsers for local development). A device may prompt for a fingerprint, face scan, device PIN, or another screen-lock method. The browser/device performs that check locally; GRAVIS AI stores the passkey public key and receives signed verification data, not a face scan or fingerprint. Keep a password sign-in available and enroll a second device before removing a passkey you rely on.
+
+The verification policy is optional enrollment, not mandatory enrollment. Accounts that have not enrolled still use their password. Phone and passkey enrollment data is stored with the workspace state and should be protected with the same access controls and backups as other account data.
+
 ## Production startup configuration
 
 Set these environment variables in the host's secret/configuration panel:
@@ -47,12 +57,15 @@ The app keeps one shared workspace state in a JSON file or one PostgreSQL JSONB 
 - Passwords are hashed. API sessions use eight-hour signed tokens; changing a password invalidates earlier tokens. Disabling an account or changing its role closes its live-update session. Login attempts are throttled in each server process.
 - Newly added and updated records are broadcast to authenticated sessions in the same workspace.
 
-The app does not crawl the web or connect to social networks, app stores, phishing feeds, email delivery, identity verification, or an operational alerting service. Brand assets organize a tracking list only. Seeded sample URLs use the reserved .example domain. Risk scores are baseline rules and need evaluation against labeled threat data before operational decisions depend on them.
+The app does not crawl the web or connect to social networks, app stores, phishing feeds, email delivery, or an operational alerting service. Brand assets organize a tracking list only. SMS verification is available only when Twilio Verify is configured. Seeded sample URLs use the reserved .example domain. Risk scores are baseline rules and need evaluation against labeled threat data before operational decisions depend on them.
 
 ## API
 
 - GET /api/health — service status and PostgreSQL connectivity when a database is configured.
 - POST /api/auth/login, GET /api/auth/me, POST /api/auth/change-password — sign-in and account details.
+- GET /api/auth/security, POST /api/auth/phone/send, POST /api/auth/phone/check, DELETE /api/auth/phone — member phone verification.
+- POST /api/auth/passkeys/register-options, POST /api/auth/passkeys/register, DELETE /api/auth/passkeys/:credentialId — member passkeys.
+- POST /api/auth/login/phone-check, POST /api/auth/login/passkey-options, POST /api/auth/login/passkey-check — sign-in factor verification.
 - GET /api/users, POST /api/users, PATCH /api/users/:id — administrator-only member management.
 - GET /api/dashboard/summary, GET /api/threats, GET /api/threats/:id — workspace dashboard and investigations.
 - POST /api/threats, PATCH /api/threats/:id/status, POST /api/threats/:id/notes — investigation workflow.

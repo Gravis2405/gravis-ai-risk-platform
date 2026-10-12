@@ -9,6 +9,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const { Pool } = require('pg');
+const { generateRegistrationOptions, verifyRegistrationResponse, generateAuthenticationOptions, verifyAuthenticationResponse } = require('@simplewebauthn/server');
 
 const envFile = path.join(__dirname, '.env');
 if (fs.existsSync(envFile)) {
@@ -55,12 +56,24 @@ const seedAssets = [
 
 if (!postgresPool) fs.mkdirSync(path.dirname(dataFile), { recursive: true });
 const demoUser = { id: 'demo-analyst', email: 'analyst@gravis.demo', name: 'Alex Morgan', role: 'admin', passwordHash: bcrypt.hashSync('GravisDemo!2026', 10), status: 'ACTIVE' };
-const defaultSettings = () => ({ workspaceName: 'GRAVIS AI Workspace', timezone: 'Asia/Kolkata', notifications: { critical: true, dailyDigest: false, caseUpdates: true } });
+const defaultSettings = () => ({ workspaceName: 'GRAVIS AI Workspace', timezone: 'Asia/Kolkata', notifications: { critical: true, dailyDigest: false, caseUpdates: true }, security: { phoneOtpEnabled: false, passkeyEnabled: false } });
+function twilioConfigured() {
+  return Boolean(process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN && process.env.TWILIO_VERIFY_SERVICE_SID);
+}
+function securitySettings() {
+  return { ...defaultSettings().security, ...(db?.settings?.security || {}) };
+}
 function prepareDb(state) {
   if (!state || !Array.isArray(state.users) || !Array.isArray(state.threats) || !Array.isArray(state.brandAssets)) throw new Error('Invalid data structure');
   if (!Array.isArray(state.registrations)) state.registrations = [];
   if (!state.settings || typeof state.settings !== 'object') state.settings = defaultSettings();
   if (!state.settings.notifications) state.settings.notifications = defaultSettings().notifications;
+  state.settings.security = { phoneOtpEnabled: state.settings.security?.phoneOtpEnabled === true, passkeyEnabled: state.settings.security?.passkeyEnabled === true };
+  for (const user of state.users) {
+    if (!Array.isArray(user.passkeys)) user.passkeys = [];
+    if (typeof user.phoneNumber !== 'string') user.phoneNumber = '';
+    if (typeof user.phoneVerified !== 'boolean') user.phoneVerified = false;
+  }
   if (production) {
     state.users = state.users.filter(user => user.email !== demoUser.email);
     state.threats = state.threats.filter(threat => threat.source !== 'Demo seed');
@@ -120,6 +133,11 @@ if (production) app.set('trust proxy', 1);
 app.use(express.static(path.join(__dirname, 'public')));
 
 const loginAttempts = new Map();
+const pendingLogins = new Map();
+const phoneEnrollmentChallenges = new Map();
+const phoneSendTimes = new Map();
+const passkeyRegistrationChallenges = new Map();
+const passkeyLoginChallenges = new Map();
 const channels = new Set(['SOCIAL_MEDIA', 'APP_STORE', 'WEB_LINK', 'BRAND_ASSET']);
 const severities = new Set(['CRITICAL', 'HIGH', 'MEDIUM', 'LOW']);
 const statuses = new Set(['DETECTED', 'INVESTIGATING', 'REPORTED', 'RESOLVED']);
@@ -128,7 +146,49 @@ const publicUser = user => ({ id: user.id, email: user.email, name: user.name, r
 function isStrongPassword(value) {
   return typeof value === 'string' && value.length >= 12 && value.length <= 128 && /[a-z]/.test(value) && /[A-Z]/.test(value) && /[0-9]/.test(value) && /[^A-Za-z0-9]/.test(value);
 }
-const userListItem = user => ({ id: user.id, email: user.email, name: user.name, role: user.role, status: user.status, createdAt: user.createdAt || null });
+const userListItem = user => ({ id: user.id, email: user.email, name: user.name, role: user.role, status: user.status, createdAt: user.createdAt || null, phoneVerified: user.phoneVerified === true, passkeyCount: Array.isArray(user.passkeys) ? user.passkeys.length : 0 });
+
+const webauthnOrigin = allowedOrigins[0];
+const webauthnRPID = new URL(webauthnOrigin).hostname;
+function webauthnContext(req) {
+  const origin = allowedOrigins.includes(req.get('origin')) ? req.get('origin') : webauthnOrigin;
+  return { origin, rpID: new URL(origin).hostname };
+}
+const e164Phone = /^\+[1-9]\d{7,14}$/;
+function providerError(res) {
+  return res.status(503).json({ error: 'Phone verification is temporarily unavailable. Check the workspace Twilio Verify configuration and try again.' });
+}
+async function twilioVerifyRequest(action, fields) {
+  if (!twilioConfigured()) throw new Error('Twilio Verify is not configured.');
+  const url = `https://verify.twilio.com/v2/Services/${encodeURIComponent(process.env.TWILIO_VERIFY_SERVICE_SID)}/${action}`;
+  const authorization = Buffer.from(`${process.env.TWILIO_ACCOUNT_SID}:${process.env.TWILIO_AUTH_TOKEN}`).toString('base64');
+  const response = await fetch(url, { method: 'POST', headers: { Authorization: `Basic ${authorization}`, 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams(fields) });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(`Twilio Verify request failed (${response.status}).`);
+  return result;
+}
+function accessToken(user) {
+  return jwt.sign({ sub: user.id, role: user.role, ver: user.tokenVersion ?? 0 }, JWT_SECRET, { expiresIn: '8h', issuer: 'gravis-ai' });
+}
+function pendingLogin(id) {
+  const pending = pendingLogins.get(id);
+  if (!pending || pending.expiresAt <= Date.now()) {
+    pendingLogins.delete(id);
+    passkeyLoginChallenges.delete(id);
+    return null;
+  }
+  return pending;
+}
+function finishLogin(id, pending) {
+  const user = db.users.find(row => row.id === pending.userId && row.status === 'ACTIVE');
+  if (!user) { pendingLogins.delete(id); return { error: 'This account is no longer active.' }; }
+  if (pending.factors.some(factor => !pending.verifiedFactors.includes(factor))) {
+    return { challengeId: id, requiredFactors: pending.factors, verifiedFactors: pending.verifiedFactors };
+  }
+  pendingLogins.delete(id);
+  passkeyLoginChallenges.delete(id);
+  return { token: accessToken(user), user: publicUser(user) };
+}
 
 function scoreRisk(signals = {}) {
   const bounded = (value, name) => {
@@ -206,6 +266,9 @@ app.get('/api/health', async (_req, res) => {
   res.json({ status: 'ok', mode: production ? 'production' : 'demo', storage: postgresPool ? 'postgresql' : 'persistent-json' });
 });
 app.post('/api/auth/login', async (req, res) => {
+  for (const [id, pending] of pendingLogins) {
+    if (pending.expiresAt <= Date.now()) { pendingLogins.delete(id); passkeyLoginChallenges.delete(id); }
+  }
   const ip = req.ip || 'unknown';
   const window = loginAttempts.get(ip) || { count: 0, resetAt: Date.now() + 15 * 60 * 1000 };
   if (window.resetAt <= Date.now()) { window.count = 0; window.resetAt = Date.now() + 15 * 60 * 1000; }
@@ -218,8 +281,69 @@ app.post('/api/auth/login', async (req, res) => {
     return res.status(401).json({ error: 'Email or password is incorrect.' });
   }
   loginAttempts.delete(ip);
-  const token = jwt.sign({ sub: user.id, role: user.role, ver: user.tokenVersion ?? 0 }, JWT_SECRET, { expiresIn: '8h', issuer: 'gravis-ai' });
-  res.json({ token, user: publicUser(user) });
+  const policy = securitySettings();
+  const factors = [];
+  if (policy.phoneOtpEnabled && user.phoneVerified === true) factors.push('phone');
+  if (policy.passkeyEnabled && Array.isArray(user.passkeys) && user.passkeys.length) factors.push('passkey');
+  if (!factors.length) return res.json({ token: accessToken(user), user: publicUser(user) });
+  const challengeId = crypto.randomUUID();
+  const pending = { userId: user.id, factors, verifiedFactors: [], expiresAt: Date.now() + 5 * 60 * 1000, attempts: 0 };
+  if (factors.includes('phone')) {
+    if (!twilioConfigured()) return providerError(res);
+    const lastSent = phoneSendTimes.get(user.id) || 0;
+    if (Date.now() - lastSent < 30_000) return res.status(429).json({ error: 'A sign-in code was sent recently. Wait 30 seconds before trying again.' });
+    try { await twilioVerifyRequest('Verifications', { To: user.phoneNumber, Channel: 'sms' }); phoneSendTimes.set(user.id, Date.now()); }
+    catch { return providerError(res); }
+  }
+  pendingLogins.set(challengeId, pending);
+  res.json({ challengeId, requiredFactors: factors, verifiedFactors: [] });
+});
+app.post('/api/auth/login/phone-check', async (req, res) => {
+  const challengeId = safeText(req.body?.challengeId, 80);
+  const pending = pendingLogin(challengeId);
+  if (!pending || !pending.factors.includes('phone') || pending.verifiedFactors.includes('phone')) return res.status(400).json({ error: 'This sign-in verification has expired. Sign in again.' });
+  const user = db.users.find(row => row.id === pending.userId && row.status === 'ACTIVE');
+  const code = safeText(req.body?.code, 10);
+  if (!user || !/^\d{4,10}$/.test(code)) return res.status(422).json({ error: 'Enter the verification code sent to your phone.' });
+  if (++pending.attempts > 5) { pendingLogins.delete(challengeId); return res.status(429).json({ error: 'Too many verification attempts. Sign in again.' }); }
+  try {
+    const result = await twilioVerifyRequest('VerificationCheck', { To: user.phoneNumber, Code: code });
+    if (result.status !== 'approved') return res.status(422).json({ error: 'That verification code is not valid. Try again.' });
+  } catch { return providerError(res); }
+  pending.verifiedFactors.push('phone');
+  const response = finishLogin(challengeId, pending);
+  if (response.error) return res.status(401).json({ error: response.error });
+  res.json(response);
+});
+app.post('/api/auth/login/passkey-options', async (req, res) => {
+  const challengeId = safeText(req.body?.challengeId, 80);
+  const pending = pendingLogin(challengeId);
+  if (!pending || !pending.factors.includes('passkey') || pending.verifiedFactors.includes('passkey')) return res.status(400).json({ error: 'This sign-in verification has expired. Sign in again.' });
+  const user = db.users.find(row => row.id === pending.userId && row.status === 'ACTIVE');
+  if (!user || !user.passkeys?.length) return res.status(400).json({ error: 'No passkey is available for this account.' });
+  const context = webauthnContext(req);
+  const options = await generateAuthenticationOptions({ rpID: context.rpID, allowCredentials: user.passkeys.map(item => ({ id: item.id, transports: item.transports })), userVerification: 'required' });
+  passkeyLoginChallenges.set(challengeId, { challenge: options.challenge, expiresAt: pending.expiresAt, ...context });
+  res.json(options);
+});
+app.post('/api/auth/login/passkey-check', async (req, res) => {
+  const challengeId = safeText(req.body?.challengeId, 80);
+  const pending = pendingLogin(challengeId);
+  const challenge = passkeyLoginChallenges.get(challengeId);
+  if (!pending || !challenge || challenge.expiresAt <= Date.now() || !pending.factors.includes('passkey') || pending.verifiedFactors.includes('passkey')) return res.status(400).json({ error: 'This sign-in verification has expired. Sign in again.' });
+  const user = db.users.find(row => row.id === pending.userId && row.status === 'ACTIVE');
+  const saved = user?.passkeys?.find(item => item.id === req.body?.id);
+  if (!saved) return res.status(400).json({ error: 'This passkey is not registered to the account.' });
+  try {
+    const verification = await verifyAuthenticationResponse({ response: req.body, expectedChallenge: challenge.challenge, expectedOrigin: challenge.origin, expectedRPID: challenge.rpID, credential: { id: saved.id, publicKey: Buffer.from(saved.publicKey, 'base64url'), counter: saved.counter, transports: saved.transports }, requireUserVerification: true });
+    if (!verification.verified) return res.status(401).json({ error: 'Passkey verification failed.' });
+    saved.counter = verification.authenticationInfo.newCounter;
+    pending.verifiedFactors.push('passkey');
+    await persist();
+    const response = finishLogin(challengeId, pending);
+    if (response.error) return res.status(401).json({ error: response.error });
+    res.json(response);
+  } catch { res.status(401).json({ error: 'Passkey verification failed. Try again or sign in again.' }); }
 });
 app.post('/api/auth/register', async (req, res) => {
   if (production) return res.status(403).json({ error: 'Self-registration is disabled. Ask a workspace administrator to create an account.' });
@@ -233,6 +357,74 @@ app.post('/api/auth/register', async (req, res) => {
   res.status(201).json({ status: 'PENDING_VERIFICATION', message: 'Registration received. Email verification is not connected in this demo, so this account cannot sign in yet.' });
 });
 app.get('/api/auth/me', authenticate, (req, res) => res.json(publicUser(req.user)));
+app.get('/api/auth/security', authenticate, (req, res) => res.json({ phoneNumber: req.user.phoneVerified ? req.user.phoneNumber : '', phoneVerified: req.user.phoneVerified === true, passkeys: (req.user.passkeys || []).map(item => ({ id: item.id, name: item.name, createdAt: item.createdAt })), policy: securitySettings(), capabilities: { phoneOtpAvailable: twilioConfigured(), passkeyAvailable: true } }));
+app.post('/api/auth/phone/send', authenticate, async (req, res) => {
+  const phoneNumber = safeText(req.body?.phoneNumber, 16);
+  if (!securitySettings().phoneOtpEnabled) return res.status(403).json({ error: 'Phone verification is not enabled by the workspace administrator.' });
+  if (!twilioConfigured()) return providerError(res);
+  if (!e164Phone.test(phoneNumber)) return res.status(422).json({ error: 'Enter a valid phone number in international format, for example +14155550123.' });
+  const lastSent = phoneSendTimes.get(req.user.id) || 0;
+  if (Date.now() - lastSent < 30_000) return res.status(429).json({ error: 'Wait 30 seconds before requesting another code.' });
+  try {
+    await twilioVerifyRequest('Verifications', { To: phoneNumber, Channel: 'sms' });
+    phoneSendTimes.set(req.user.id, Date.now());
+    phoneEnrollmentChallenges.set(req.user.id, { phoneNumber, expiresAt: Date.now() + 10 * 60 * 1000, attempts: 0 });
+    res.json({ message: 'Verification code sent.' });
+  } catch { providerError(res); }
+});
+app.post('/api/auth/phone/check', authenticate, async (req, res) => {
+  const challenge = phoneEnrollmentChallenges.get(req.user.id);
+  const code = safeText(req.body?.code, 10);
+  if (!challenge || challenge.expiresAt <= Date.now()) { phoneEnrollmentChallenges.delete(req.user.id); return res.status(400).json({ error: 'Request a new verification code and try again.' }); }
+  if (!/^\d{4,10}$/.test(code)) return res.status(422).json({ error: 'Enter the verification code sent to your phone.' });
+  if (++challenge.attempts > 5) { phoneEnrollmentChallenges.delete(req.user.id); return res.status(429).json({ error: 'Too many attempts. Request a new verification code.' }); }
+  try {
+    const result = await twilioVerifyRequest('VerificationCheck', { To: challenge.phoneNumber, Code: code });
+    if (result.status !== 'approved') return res.status(422).json({ error: 'That verification code is not valid. Try again.' });
+    req.user.phoneNumber = challenge.phoneNumber;
+    req.user.phoneVerified = true;
+    phoneEnrollmentChallenges.delete(req.user.id);
+    await persist();
+    res.json({ message: 'Phone number verified.', phoneNumber: req.user.phoneNumber, phoneVerified: true });
+  } catch { providerError(res); }
+});
+app.delete('/api/auth/phone', authenticate, async (req, res) => {
+  req.user.phoneNumber = '';
+  req.user.phoneVerified = false;
+  phoneEnrollmentChallenges.delete(req.user.id);
+  await persist();
+  res.json({ message: 'Phone verification removed.' });
+});
+app.post('/api/auth/passkeys/register-options', authenticate, async (req, res) => {
+  if (!securitySettings().passkeyEnabled) return res.status(403).json({ error: 'Passkeys are not enabled by the workspace administrator.' });
+  if ((req.user.passkeys || []).length >= 10) return res.status(409).json({ error: 'This account already has the maximum of 10 registered passkeys.' });
+  const context = webauthnContext(req);
+  const options = await generateRegistrationOptions({ rpName: 'GRAVIS AI', rpID: context.rpID, userName: req.user.email, userID: Buffer.from(req.user.id), attestationType: 'none', authenticatorSelection: { residentKey: 'preferred', userVerification: 'required', authenticatorAttachment: 'platform' }, supportedAlgorithmIDs: [-7, -257], excludeCredentials: (req.user.passkeys || []).map(item => ({ id: item.id, transports: item.transports })) });
+  passkeyRegistrationChallenges.set(req.user.id, { challenge: options.challenge, expiresAt: Date.now() + 5 * 60 * 1000, ...context });
+  res.json(options);
+});
+app.post('/api/auth/passkeys/register', authenticate, async (req, res) => {
+  const challenge = passkeyRegistrationChallenges.get(req.user.id);
+  if (!challenge || challenge.expiresAt <= Date.now()) { passkeyRegistrationChallenges.delete(req.user.id); return res.status(400).json({ error: 'Passkey setup expired. Start again.' }); }
+  passkeyRegistrationChallenges.delete(req.user.id);
+  try {
+    const verification = await verifyRegistrationResponse({ response: req.body, expectedChallenge: challenge.challenge, expectedOrigin: challenge.origin, expectedRPID: challenge.rpID });
+    if (!verification.verified || !verification.registrationInfo) return res.status(400).json({ error: 'The passkey could not be verified by this device.' });
+    const credential = verification.registrationInfo.credential;
+    req.user.passkeys = Array.isArray(req.user.passkeys) ? req.user.passkeys : [];
+    if (req.user.passkeys.some(item => item.id === credential.id)) return res.status(409).json({ error: 'This passkey is already registered.' });
+    req.user.passkeys.push({ id: credential.id, publicKey: Buffer.from(credential.publicKey).toString('base64url'), counter: credential.counter, transports: credential.transports || [], name: safeText(req.body?.name, 50) || 'Device passkey', createdAt: new Date().toISOString() });
+    await persist();
+    res.status(201).json({ message: 'Passkey added.', passkeys: req.user.passkeys.map(item => ({ id: item.id, name: item.name, createdAt: item.createdAt })) });
+  } catch { res.status(400).json({ error: 'The passkey could not be verified. Try again on this device.' }); }
+});
+app.delete('/api/auth/passkeys/:credentialId', authenticate, async (req, res) => {
+  const before = (req.user.passkeys || []).length;
+  req.user.passkeys = (req.user.passkeys || []).filter(item => item.id !== req.params.credentialId);
+  if (req.user.passkeys.length === before) return res.status(404).json({ error: 'Passkey not found.' });
+  await persist();
+  res.json({ message: 'Passkey removed.', passkeys: req.user.passkeys.map(item => ({ id: item.id, name: item.name, createdAt: item.createdAt })) });
+});
 app.post('/api/auth/change-password', authenticate, async (req, res) => {
   const current = req.body?.currentPassword;
   const next = req.body?.newPassword;
@@ -335,16 +527,20 @@ app.get('/api/analytics', authenticate, (req, res) => {
   });
   res.json({ days, total: recent.length, severity: group('severity', [...severities]), channel: group('channel', [...channels]), status: group('status', [...statuses]), daily });
 });
-app.get('/api/settings', authenticate, (_req, res) => res.json(db.settings));
+app.get('/api/settings', authenticate, (_req, res) => res.json({ ...db.settings, security: securitySettings(), capabilities: { phoneOtpAvailable: twilioConfigured(), passkeyAvailable: true } }));
 app.patch('/api/settings', authenticate, requireAdmin, async (req, res) => {
   const name = safeText(req.body?.workspaceName, 80);
   const notifications = req.body?.notifications;
   if (!name) return res.status(422).json({ error: 'Workspace name cannot be empty.' });
   if (!notifications || ['critical', 'dailyDigest', 'caseUpdates'].some(key => typeof notifications[key] !== 'boolean')) return res.status(422).json({ error: 'Choose a value for each notification preference.' });
+  const security = req.body?.security;
+  if (security !== undefined && (!security || typeof security.phoneOtpEnabled !== 'boolean' || typeof security.passkeyEnabled !== 'boolean')) return res.status(422).json({ error: 'Choose a value for each verification setting.' });
+  if (security?.phoneOtpEnabled && !twilioConfigured()) return res.status(503).json({ error: 'Configure Twilio Verify credentials on the server before enabling phone verification.' });
   db.settings.workspaceName = name;
   db.settings.notifications = { critical: notifications.critical, dailyDigest: notifications.dailyDigest, caseUpdates: notifications.caseUpdates };
+  if (security) db.settings.security = { phoneOtpEnabled: security.phoneOtpEnabled, passkeyEnabled: security.passkeyEnabled };
   await persist();
-  res.json(db.settings);
+  res.json({ ...db.settings, capabilities: { phoneOtpAvailable: twilioConfigured(), passkeyAvailable: true } });
 });
 
 app.get('/api/users', authenticate, requireAdmin, (_req, res) => {
